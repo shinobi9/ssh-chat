@@ -92,7 +92,9 @@ func (l *SSHListener) Serve() {
 		host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
 		if err != nil {
 			logger.Printf("Failed to split remote addr: %v", err)
-		} else {
+		}
+
+		if err == nil {
 			// Context with timeout is not strictly needed for memory store, but good practice
 			// Although Take is non-blocking for memory store usually.
 			_, _, _, ok, err := l.limiter.Take(context.Background(), host)
