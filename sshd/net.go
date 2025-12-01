@@ -2,6 +2,7 @@ package sshd
 
 import (
 	"net"
+	"sync"
 	"time"
 
 	"github.com/shazow/rateio"
@@ -16,8 +17,12 @@ type SSHListener struct {
 	RateLimit   func() rateio.Limiter
 	HandlerFunc func(term *Terminal)
 
-	// handshakeLimit is a semaphore to limit concurrent handshakes
+	// handshakeLimit is a semaphore to limit concurrent handshakes globally
 	handshakeLimit chan struct{}
+
+	// connLimit tracks concurrent handshakes per IP
+	connLimitMutex sync.Mutex
+	connLimit      map[string]int
 }
 
 // ListenSSH makes an SSH listener socket
@@ -30,6 +35,7 @@ func ListenSSH(laddr string, config *ssh.ServerConfig) (*SSHListener, error) {
 		Listener:       socket,
 		config:         config,
 		handshakeLimit: make(chan struct{}, 20),
+		connLimit:      make(map[string]int),
 	}
 	return &l, nil
 }
@@ -68,14 +74,63 @@ func (l *SSHListener) Serve() {
 			break
 		}
 
-		// Acquire semaphore
+		// Check per-IP limit
+		host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+		if err != nil {
+			// If we can't parse the IP, we assume it's unique or just let it through to the global limiter
+			// but best effort is to log and proceed.
+			logger.Printf("Failed to split remote addr: %v", err)
+		} else {
+			l.connLimitMutex.Lock()
+			count := l.connLimit[host]
+			if count >= 3 {
+				l.connLimitMutex.Unlock()
+				logger.Printf("[%s] Rejected connection: too many concurrent handshakes", conn.RemoteAddr())
+				conn.Close()
+				continue
+			}
+			l.connLimit[host]++
+			l.connLimitMutex.Unlock()
+		}
+
+		// Acquire global semaphore
 		l.handshakeLimit <- struct{}{}
 
 		// Goroutineify to resume accepting sockets early
 		go func() {
+			// Ensure limits are released when this goroutine finishes (in case of panic)
+			// OR explicitly release them after handshake.
+			// Ideally we release them as soon as handshake is done.
+
+			// We need a way to ensure release happens exactly once.
+			released := false
+			release := func() {
+				if released {
+					return
+				}
+				released = true
+
+				// Release global semaphore
+				<-l.handshakeLimit
+
+				// Release per-IP limit
+				if host != "" {
+					l.connLimitMutex.Lock()
+					l.connLimit[host]--
+					if l.connLimit[host] == 0 {
+						delete(l.connLimit, host)
+					}
+					l.connLimitMutex.Unlock()
+				}
+			}
+
+			// Defer release in case of panic or early return
+			defer release()
+
 			term, err := l.handleConn(conn)
-			// Release semaphore
-			<-l.handshakeLimit
+
+			// Handshake is done (success or failure). Release limits.
+			release()
 
 			if err != nil {
 				logger.Printf("[%s] Failed to handshake: %s", conn.RemoteAddr(), err)
