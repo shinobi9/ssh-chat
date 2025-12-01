@@ -15,6 +15,9 @@ type SSHListener struct {
 
 	RateLimit   func() rateio.Limiter
 	HandlerFunc func(term *Terminal)
+
+	// handshakeLimit is a semaphore to limit concurrent handshakes
+	handshakeLimit chan struct{}
 }
 
 // ListenSSH makes an SSH listener socket
@@ -23,7 +26,11 @@ func ListenSSH(laddr string, config *ssh.ServerConfig) (*SSHListener, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := SSHListener{Listener: socket, config: config}
+	l := SSHListener{
+		Listener:       socket,
+		config:         config,
+		handshakeLimit: make(chan struct{}, 20),
+	}
 	return &l, nil
 }
 
@@ -35,7 +42,7 @@ func (l *SSHListener) handleConn(conn net.Conn) (*Terminal, error) {
 
 	// If the connection doesn't write anything back for too long before we get
 	// a valid session, it should be dropped.
-	var handleTimeout = 20 * time.Second
+	var handleTimeout = 10 * time.Second
 	conn.SetReadDeadline(time.Now().Add(handleTimeout))
 	defer conn.SetReadDeadline(time.Time{})
 
@@ -61,9 +68,15 @@ func (l *SSHListener) Serve() {
 			break
 		}
 
+		// Acquire semaphore
+		l.handshakeLimit <- struct{}{}
+
 		// Goroutineify to resume accepting sockets early
 		go func() {
 			term, err := l.handleConn(conn)
+			// Release semaphore
+			<-l.handshakeLimit
+
 			if err != nil {
 				logger.Printf("[%s] Failed to handshake: %s", conn.RemoteAddr(), err)
 				conn.Close() // Must be closed to avoid a leak
