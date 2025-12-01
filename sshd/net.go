@@ -111,29 +111,13 @@ func (l *SSHListener) Serve() {
 
 		// Goroutineify to resume accepting sockets early
 		go func() {
-			// Ensure limits are released when this goroutine finishes (in case of panic)
-			// OR explicitly release them after handshake.
-			released := false
-			release := func() {
-				if released {
-					return
-				}
-				released = true
-
-				// Release global semaphore
-				<-l.handshakeLimit
-			}
-
-			// Defer release in case of panic or early return
-			defer release()
-
 			term, err := l.handleConn(conn)
 
 			// Handshake is done (success or failure). Release limits.
 			// Explicit release is required because l.HandlerFunc below
 			// runs for the duration of the session. We only want to limit
 			// concurrent handshakes, not concurrent sessions.
-			release()
+			<-l.handshakeLimit
 
 			if err != nil {
 				logger.Printf("[%s] Failed to handshake: %s", conn.RemoteAddr(), err)
