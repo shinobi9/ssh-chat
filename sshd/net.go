@@ -1,10 +1,12 @@
 package sshd
 
 import (
+	"context"
 	"net"
-	"sync"
 	"time"
 
+	"github.com/sethvargo/go-limiter"
+	"github.com/sethvargo/go-limiter/memorystore"
 	"github.com/shazow/rateio"
 	"golang.org/x/crypto/ssh"
 )
@@ -20,9 +22,8 @@ type SSHListener struct {
 	// handshakeLimit is a semaphore to limit concurrent handshakes globally
 	handshakeLimit chan struct{}
 
-	// connLimit tracks concurrent handshakes per IP
-	connLimitMutex sync.Mutex
-	connLimit      map[string]int
+	// limiter is the per-IP rate limiter
+	limiter limiter.Store
 }
 
 // ListenSSH makes an SSH listener socket
@@ -31,11 +32,24 @@ func ListenSSH(laddr string, config *ssh.ServerConfig) (*SSHListener, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Create a rate limiter: 3 attempts per second per IP?
+	// The user wanted to "throttle many connections".
+	// 3 per second is generous for a chat server.
+	// If an IP connects >3 times in a second, it's likely a bot or flood.
+	store, err := memorystore.New(&memorystore.Config{
+		Tokens:   3,
+		Interval: time.Second,
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	l := SSHListener{
 		Listener:       socket,
 		config:         config,
 		handshakeLimit: make(chan struct{}, 20),
-		connLimit:      make(map[string]int),
+		limiter:        store,
 	}
 	return &l, nil
 }
@@ -74,23 +88,22 @@ func (l *SSHListener) Serve() {
 			break
 		}
 
-		// Check per-IP limit
+		// Check per-IP limit using go-limiter
 		host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
 		if err != nil {
-			// If we can't parse the IP, we assume it's unique or just let it through to the global limiter
-			// but best effort is to log and proceed.
 			logger.Printf("Failed to split remote addr: %v", err)
 		} else {
-			l.connLimitMutex.Lock()
-			count := l.connLimit[host]
-			if count >= 3 {
-				l.connLimitMutex.Unlock()
-				logger.Printf("[%s] Rejected connection: too many concurrent handshakes", conn.RemoteAddr())
+			// Context with timeout is not strictly needed for memory store, but good practice
+			// Although Take is non-blocking for memory store usually.
+			_, _, _, ok, err := l.limiter.Take(context.Background(), host)
+			if err != nil {
+				// Store error (shouldn't happen with memory store unless closed)
+				logger.Printf("Rate limiter error: %v", err)
+			} else if !ok {
+				logger.Printf("[%s] Rejected connection: rate limit exceeded", conn.RemoteAddr())
 				conn.Close()
 				continue
 			}
-			l.connLimit[host]++
-			l.connLimitMutex.Unlock()
 		}
 
 		// Acquire global semaphore
@@ -100,9 +113,6 @@ func (l *SSHListener) Serve() {
 		go func() {
 			// Ensure limits are released when this goroutine finishes (in case of panic)
 			// OR explicitly release them after handshake.
-			// Ideally we release them as soon as handshake is done.
-
-			// We need a way to ensure release happens exactly once.
 			released := false
 			release := func() {
 				if released {
@@ -112,16 +122,6 @@ func (l *SSHListener) Serve() {
 
 				// Release global semaphore
 				<-l.handshakeLimit
-
-				// Release per-IP limit
-				if host != "" {
-					l.connLimitMutex.Lock()
-					l.connLimit[host]--
-					if l.connLimit[host] == 0 {
-						delete(l.connLimit, host)
-					}
-					l.connLimitMutex.Unlock()
-				}
 			}
 
 			// Defer release in case of panic or early return
