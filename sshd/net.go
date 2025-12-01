@@ -130,6 +130,9 @@ func (l *SSHListener) Serve() {
 			term, err := l.handleConn(conn)
 
 			// Handshake is done (success or failure). Release limits.
+			// Explicit release is required because l.HandlerFunc below
+			// runs for the duration of the session. We only want to limit
+			// concurrent handshakes, not concurrent sessions.
 			release()
 
 			if err != nil {
