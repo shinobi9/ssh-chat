@@ -9,10 +9,8 @@ RUN make build
 
 FROM alpine
 
-RUN apk add openssh
-RUN mkdir /root/.ssh
-WORKDIR /root/.ssh
-RUN ssh-keygen -t rsa -C "chatkey" -f id_rsa
+RUN apk add --no-cache openssh tzdata && \
+      ssh-keygen -t rsa -C "chatkey" -f /root/.ssh/id_rsa
 
 WORKDIR /usr/local/bin
 
